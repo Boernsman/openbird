@@ -23,6 +23,8 @@ button{margin-top:1rem;padding:.5rem 1rem;font-size:1rem}.msg{padding:.5rem;back
 <tr><td>Uptime</td><td>%UPTIME%</td></tr>
 <tr><td>Doorbell</td><td>%DOORBELL%</td></tr>
 <tr><td>Event clients</td><td>%MONITORS%</td></tr>
+<tr><td>Notifications</td><td>%NOTIFY%</td></tr>
+<tr><td>Time</td><td>%TIME%</td></tr>
 </table>
 
 <h2>Relay test</h2>

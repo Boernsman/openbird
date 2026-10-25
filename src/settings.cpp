@@ -11,10 +11,11 @@ static const char *NAMESPACE = "openbird";
 void settingsLoad()
 {
     Preferences prefs;
-    prefs.begin(NAMESPACE, true);
-    settings.user = prefs.getString("user", OPENBIRD_USER);
-    settings.password = prefs.getString("password", OPENBIRD_PASSWORD);
-    settings.relayPulseMs = prefs.getUInt("relayPulse", RELAY_PULSE_MS);
+    prefs.begin(NAMESPACE, false); // read-write: creates the namespace on first boot
+    // isKey() first: Preferences logs an error for every missing key
+    settings.user = prefs.isKey("user") ? prefs.getString("user") : String(OPENBIRD_USER);
+    settings.password = prefs.isKey("password") ? prefs.getString("password") : String(OPENBIRD_PASSWORD);
+    settings.relayPulseMs = prefs.isKey("relayPulse") ? prefs.getUInt("relayPulse") : RELAY_PULSE_MS;
     prefs.end();
 }
 

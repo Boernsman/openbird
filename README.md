@@ -8,6 +8,7 @@ discovery and doorbell events.
 - Doorbell button input → `doorbell:H` / `doorbell:L` events on `monitor.cgi`
 - Door opener relay output → `open-door.cgi?r=1`
 - Optional: second relay (`r=2`), PIR motion input (`motionsensor` events), light output (`light-on.cgi`)
+- Favorites and schedules (`favorites.cgi`, `schedule.cgi`): HTTP(S) notifications and relay actions on ring or motion, e.g. for Home Assistant's DoorBird integration
 - Settings page (username, password, relay pulse) stored in flash
 - Network firmware updates (ArduinoOTA), watchdog, factory reset button
 
@@ -55,6 +56,11 @@ pio run -t upload        # first flash over USB
 pio device monitor
 ```
 
+Keep DTR and RTS deasserted on the USB serial port. The serial default asserts
+them, which disturbs the board and drops the Ethernet link until the next
+reset. `platformio.ini` sets `monitor_dtr = 0` and `monitor_rts = 0` for
+`pio device monitor`. Opening the port this way resets the board once.
+
 Later updates can go over the network. The OTA password is the device
 password:
 
@@ -83,16 +89,51 @@ constant.
 
 | Endpoint                       | Behaviour                                                          |
 |--------------------------------|--------------------------------------------------------------------|
-| `getsession.cgi`               | Returns `SESSIONID` (random per boot)                              |
+| `getsession.cgi`               | Returns `SESSIONID` (random per boot), `?invalidate=<id>` drops it |
 | `info.cgi`                     | Firmware, MAC, relays, device type                                 |
 | `open-door.cgi?r=1\|2`         | Pulses the relay for `RELAY_PULSE_MS`                              |
 | `light-on.cgi`                 | Switches the light output on for `LIGHT_ON_MS` (no-op if not fitted)|
+| `monitor.cgi?check=doorbell`   | Legacy one-shot state, `doorbell=0\|1`                            |
 | `monitor.cgi?ring=doorbell,motionsensor` | `multipart/x-mixed-replace` stream (boundary `--ioboundary`), current state on connect, heartbeat every 30 s. Max 4 clients; a new one replaces the oldest. TCP keepalive drops dead clients |
-| `favorites.cgi`, `schedule.cgi`| Return empty lists; saves are accepted but not stored              |
+| `favorites.cgi`                | List, `action=save` (new id in the `favoriteid` header), `action=remove` (also drops schedule outputs using it) |
+| `schedule.cgi`                 | List (`?input=` filter, 204 if none), POST JSON entry (replaces same input+param), `action=remove` |
 | `restart.cgi`                  | Reboots                                                            |
 | `image.cgi`, `video.cgi`, `history.cgi`, audio | `503`, there is no camera or audio                 |
 
-Quick test:
+### Schedules
+
+Schedule outputs are evaluated on a doorbell press (`input: doorbell`) or
+motion (`input: motion`):
+
+- `http` calls the HTTP favorite with the given id. HTTPS is supported, but
+  certificates are not checked (same as DoorBird).
+- `relay` pulses the given relay.
+- `notify` and `sip` are stored but do nothing.
+
+Time windows (`weekdays`, `from-to`) are evaluated in UTC, using NTP
+(`NTP_SERVER`, default `pool.ntp.org`). Until the clock is set,
+every window counts as active, so a ring is never lost. `once` windows are not
+supported. Favorites and schedules are each limited to about 3.9 KB of JSON
+(507 if exceeded). They are cleared by a factory reset.
+
+## Checking a device
+
+`tools/check_device.py` runs the nymea plugin's requests against a device:
+the 401 challenge, `getsession`, `info`, the event stream, and a favorite +
+schedule round trip. It needs only the Python standard library. `--discover`
+uses the `zeroconf` package.
+
+```sh
+tools/check_device.py --host bha-<mac>.local --user openbird --password changeme
+tools/check_device.py --discover --ring      # find via mDNS, then press the button
+tools/check_device.py --host ... --open      # also pulses relay 1
+```
+
+`--ring` also checks that the test favorite gets called when the button is
+pressed. The test adds its output to an existing doorbell schedule and removes
+it again afterwards; other schedules are left alone.
+
+Quick test with curl:
 
 ```sh
 curl -u openbird:changeme http://bha-<mac>.local/bha-api/info.cgi

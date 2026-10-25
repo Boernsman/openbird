@@ -4,6 +4,7 @@
 //   mDNS:  _axis-video._tcp, host "bha-<mac>", TXT "macaddress=<MAC>"
 //   HTTP:  /bha-api/getsession.cgi, info.cgi, open-door.cgi, light-on.cgi,
 //          monitor.cgi (multipart event stream), favorites.cgi, schedule.cgi, restart.cgi
+// Favorites and schedules trigger HTTP notifications and relays on ring/motion.
 // Plus a settings page on "/", ArduinoOTA updates and factory reset via BUT1.
 
 #include <Arduino.h>
@@ -17,6 +18,7 @@
 #include <lwip/sockets.h>
 
 #include "config.h"
+#include "notify.h"
 #include "settings.h"
 #include "webpage.h"
 
@@ -24,10 +26,12 @@ static WiFiServer server(80);
 static volatile bool ethConnected = false;
 static bool mdnsStarted = false;
 static bool otaStarted = false;
+static bool ntpStarted = false;
 
 static String macAddress;    // "1CCAE3AABBCC" style, upper case, no colons
 static String mdnsHost;      // "bha-1ccae3aabbcc"
 static String sessionId;
+static String notificationKey;
 static String expectedAuth;  // "Basic <base64(user:pass)>"
 static String formToken;     // guards the settings form against cross-site posts
 
@@ -213,8 +217,11 @@ struct Request {
     String path;
     String query;
     String authorization;
-    String body; // only read for small bodies (form posts)
+    long contentLength = -1; // -1 = no Content-Length header
+    String body;             // only read up to MAX_BODY_SIZE
 };
+
+static const long MAX_BODY_SIZE = 4096;
 
 static String urlDecode(const String &s)
 {
@@ -277,7 +284,6 @@ static bool readRequest(WiFiClient &client, Request &req)
     req.query = q < 0 ? String() : target.substring(q + 1);
 
     // Headers
-    long contentLength = 0;
     while (client.connected()) {
         String h = client.readStringUntil('\n');
         h.trim();
@@ -287,15 +293,15 @@ static bool readRequest(WiFiClient &client, Request &req)
             req.authorization = h.substring(14);
             req.authorization.trim();
         } else if (h.length() > 15 && h.substring(0, 15).equalsIgnoreCase("Content-Length:")) {
-            contentLength = h.substring(15).toInt();
+            req.contentLength = h.substring(15).toInt();
         }
     }
 
-    if (contentLength > 0 && contentLength <= 2048) {
-        char buf[2049];
-        size_t n = client.readBytes(buf, contentLength);
+    if (req.contentLength > 0 && req.contentLength <= MAX_BODY_SIZE) {
+        std::unique_ptr<char[]> buf(new char[req.contentLength + 1]);
+        size_t n = client.readBytes(buf.get(), req.contentLength);
         buf[n] = 0;
-        req.body = buf;
+        req.body = buf.get();
     }
     return true;
 }
@@ -394,9 +400,8 @@ static void handleInfo(WiFiClient &client)
         relayList += ",\"2\"";
     String json = "{\"BHA\":{\"RETURNCODE\":\"1\",\"VERSION\":[{";
     json += "\"FIRMWARE\":\"" FIRMWARE_VERSION "\",";
-    json += "\"BUILD_NUMBER\":\"" __DATE__ "\",";
+    json += "\"BUILD_NUMBER\":\"" BUILD_NUMBER "\",";
     json += "\"PRIMARY_MAC_ADDR\":\"" + macAddress + "\",";
-    json += "\"WIFI_MAC_ADDR\":\"" + macAddress + "\",";
     json += "\"RELAYS\":[" + relayList + "],";
     json += "\"DEVICE-TYPE\":\"" DEVICE_TYPE "\"";
     json += "}]}}";
@@ -425,6 +430,18 @@ static void handleLightOn(WiFiClient &client)
 
 static bool handleMonitor(WiFiClient &client, const Request &req)
 {
+    // Legacy one-shot state query, still used by some clients: "doorbell=0|1"
+    String check = queryParam(req.query, "check");
+    if (!check.isEmpty()) {
+        const Input *in = check == "doorbell" ? &doorbell : check == "motionsensor" ? &motion : nullptr;
+        if (!in) {
+            sendResponse(client, 400, "Bad Request", "text/plain", "Invalid check\n");
+        } else {
+            sendResponse(client, 200, "OK", "text/plain", check + "=" + (in->state ? "1" : "0") + "\r\n");
+        }
+        return false;
+    }
+
     String ring = queryParam(req.query, "ring");
     bool wantDoorbell = ring.isEmpty() || ring.indexOf("doorbell") >= 0;
     bool wantMotion = ring.isEmpty() || ring.indexOf("motionsensor") >= 0;
@@ -466,6 +483,18 @@ static String formatUptime()
     return buf;
 }
 
+static String formatTime()
+{
+    time_t now = time(nullptr);
+    if (now < 1700000000)
+        return "not synchronized";
+    struct tm utc;
+    gmtime_r(&now, &utc);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &utc);
+    return buf;
+}
+
 static void sendSettingsPage(WiFiClient &client, const String &message, bool error)
 {
     String page = SETTINGS_PAGE;
@@ -480,6 +509,8 @@ static void sendSettingsPage(WiFiClient &client, const String &message, bool err
     page.replace("%UPTIME%", formatUptime());
     page.replace("%DOORBELL%", doorbell.pin < 0 ? "not fitted" : doorbell.state ? "pressed" : "idle");
     page.replace("%MONITORS%", String(monitorCount()) + " / " + String(MAX_MONITOR_CLIENTS));
+    page.replace("%NOTIFY%", String(favoritesCount()) + " favorites, " + String(schedulesCount()) + " schedules");
+    page.replace("%TIME%", formatTime());
     page.replace("%TOKEN%", formToken);
     page.replace("%USER%", htmlEscape(settings.user));
     page.replace("%PULSE%", String(settings.relayPulseMs));
@@ -530,6 +561,66 @@ static void handleSettingsPost(WiFiClient &client, const Request &req)
     sendSettingsPage(client, "Settings saved.", false);
 }
 
+// ---- Favorites and schedules ---------------------------------------------------------
+
+static void sendStatus(WiFiClient &client, int code)
+{
+    switch (code) {
+    case 200: sendResponse(client, 200, "OK", "text/plain", ""); break;
+    case 204: sendResponse(client, 204, "No Content", "text/plain", ""); break;
+    case 400: sendResponse(client, 400, "Bad Request", "text/plain", "Parameter missing or invalid\n"); break;
+    case 507: sendResponse(client, 507, "Insufficient Storage", "text/plain", "Size limit exceeded\n"); break;
+    default: sendResponse(client, 500, "Internal Server Error", "text/plain", "Internal error\n"); break;
+    }
+}
+
+static void handleFavorites(WiFiClient &client, const Request &req)
+{
+    String action = queryParam(req.query, "action");
+    String type = queryParam(req.query, "type");
+    String id = queryParam(req.query, "id");
+    if (action.isEmpty()) {
+        sendJson(client, favoritesJson());
+    } else if (action == "save") {
+        int savedId = -1;
+        int code = favoritesSave(type, queryParam(req.query, "title"), queryParam(req.query, "value"), id, savedId);
+        if (code == 200) {
+            // The id of the saved favorite is reported in a response header
+            String header = "favoriteid: " + String(savedId) + "\r\n";
+            sendResponse(client, 200, "OK", "text/plain", "", header.c_str());
+        } else {
+            sendStatus(client, code);
+        }
+    } else if (action == "remove") {
+        sendStatus(client, favoritesRemove(type, id));
+    } else {
+        sendStatus(client, 400);
+    }
+}
+
+static void handleSchedule(WiFiClient &client, const Request &req)
+{
+    String action = queryParam(req.query, "action");
+    if (req.method == "POST") {
+        // DoorBird requires a matching Content-Length, the body must be complete
+        if (req.contentLength <= 0 || req.contentLength > MAX_BODY_SIZE || (long)req.body.length() != req.contentLength)
+            sendStatus(client, 400);
+        else
+            sendStatus(client, scheduleSave(req.body));
+    } else if (action == "remove") {
+        sendStatus(client, scheduleRemove(queryParam(req.query, "input"), queryParam(req.query, "param")));
+    } else if (action.isEmpty()) {
+        String json;
+        int code = schedulesJson(queryParam(req.query, "input"), json);
+        if (code == 200)
+            sendJson(client, json);
+        else
+            sendStatus(client, code);
+    } else {
+        sendStatus(client, 400);
+    }
+}
+
 // Returns true if the client connection was handed over and must not be closed.
 static bool handleRequest(WiFiClient &client, const Request &req)
 {
@@ -556,11 +647,16 @@ static bool handleRequest(WiFiClient &client, const Request &req)
 
     const String cgi = req.path.substring(9);
     if (cgi == "getsession.cgi") {
-        if (!queryParam(req.query, "invalidate").isEmpty()) {
-            sendOk(client);
+        bool invalidate = false;
+        String oldSession = queryParam(req.query, "invalidate", &invalidate);
+        if (invalidate) {
+            if (oldSession == sessionId)
+                sessionId = randomHex(32);
+            sendJson(client, "{\"BHA\":{\"RETURNCODE\":\"1\",\"SESSIONID\":\"\"}}");
         } else {
+            // The key is only used for UDP broadcasts, which OpenBird does not send
             sendJson(client, "{\"BHA\":{\"RETURNCODE\":\"1\",\"SESSIONID\":\"" + sessionId +
-                                 "\",\"NOTIFICATION_ENCRYPTION_KEY\":\"\"}}");
+                                 "\",\"NOTIFICATION_ENCRYPTION_KEY\":\"" + notificationKey + "\"}}");
         }
     } else if (cgi == "info.cgi") {
         handleInfo(client);
@@ -571,13 +667,9 @@ static bool handleRequest(WiFiClient &client, const Request &req)
     } else if (cgi == "monitor.cgi") {
         return handleMonitor(client, req);
     } else if (cgi == "favorites.cgi") {
-        // No notification targets are stored; report an empty list and accept saves
-        if (req.query.indexOf("action=") >= 0)
-            sendOk(client);
-        else
-            sendJson(client, "{\"http\":{},\"sip\":{}}");
+        handleFavorites(client, req);
     } else if (cgi == "schedule.cgi") {
-        sendJson(client, "[]");
+        handleSchedule(client, req);
     } else if (cgi == "restart.cgi") {
         sendOk(client);
         client.flush();
@@ -630,6 +722,15 @@ static void startMdns()
     Serial.printf("mDNS: %s.local\n", mdnsHost.c_str());
 }
 
+// Time for schedule windows (UTC), started once an IP address is assigned
+static void startNtp()
+{
+    if (ntpStarted)
+        return;
+    configTime(0, 0, NTP_SERVER);
+    ntpStarted = true;
+}
+
 static void startOta()
 {
     if (otaStarted)
@@ -661,6 +762,7 @@ static void onNetworkEvent(WiFiEvent_t event)
         String host = "openbird-" + macAddress.substring(6);
         host.toLowerCase();
         ETH.setHostname(host.c_str()); // DHCP host name
+        Serial.println("ETH started");
         break;
     }
     case ARDUINO_EVENT_ETH_CONNECTED:
@@ -696,6 +798,7 @@ static void resetButtonLoop()
         } else if (millis() - pressedSince >= RESET_HOLD_MS) {
             Serial.println("Factory reset");
             settingsReset();
+            notifyReset();
             delay(100);
             ESP.restart();
         }
@@ -728,6 +831,11 @@ void setup()
 
     settingsLoad();
     formToken = randomHex(16);
+    notificationKey = randomHex(32);
+    notifyBegin([](int relay) {
+        if (relay >= 1 && relay <= 2 && relays[relay - 1].pin >= 0)
+            outputPulse(relays[relay - 1], settings.relayPulseMs);
+    });
 
     // Read the MAC before ETH.begin(), the ETH_START event already needs it
     uint8_t mac[6];
@@ -741,7 +849,9 @@ void setup()
     applyCredentials();
 
     WiFi.onEvent(onNetworkEvent);
-    ETH.begin(); // LAN8720 pin mapping comes from the esp32-poe-iso board variant
+    // LAN8720 pin mapping comes from the esp32-poe-iso board variant
+    if (!ETH.begin())
+        Serial.println("ETH init failed");
 
     server.begin();
 }
@@ -753,10 +863,14 @@ void loop()
     if (inputLoop(doorbell)) {
         Serial.printf("Doorbell %s\n", doorbell.state ? "pressed" : "released");
         monitorBroadcast(doorbell);
+        if (doorbell.state)
+            notifyTrigger("doorbell");
     }
     if (inputLoop(motion)) {
         Serial.printf("Motion %s\n", motion.state ? "detected" : "cleared");
         monitorBroadcast(motion);
+        if (motion.state)
+            notifyTrigger("motion");
     }
     resetButtonLoop();
 
@@ -765,6 +879,7 @@ void loop()
     outputLoop(light);
 
     if (ethConnected) {
+        startNtp();
         startOta();
         ArduinoOTA.handle();
         httpLoop();

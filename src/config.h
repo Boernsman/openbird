@@ -85,10 +85,23 @@
 #define WATCHDOG_TIMEOUT_S 30
 #endif
 
+// ---- Notifications ---------------------------------------------------------------
+#ifndef NOTIFY_TIMEOUT_MS
+#define NOTIFY_TIMEOUT_MS 5000 // per HTTP favorite request
+#endif
+// Schedules are evaluated in UTC
+#ifndef NTP_SERVER
+#define NTP_SERVER "pool.ntp.org"
+#endif
+
 // ---- Reported device info ----------------------------------------------------
 #ifndef DEVICE_TYPE
 #define DEVICE_TYPE "OpenBird ESP32-PoE-ISO"
 #endif
+// Favorites and schedules require at least 000110 on a real DoorBird, clients check this
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "000100"
+#define FIRMWARE_VERSION "000130"
+#endif
+#ifndef BUILD_NUMBER
+#define BUILD_NUMBER "1"
 #endif
