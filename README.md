@@ -147,3 +147,7 @@ Add a "DoorBird" thing and pick the discovered `OpenBird - <MAC>` entry. Then
 enter the configured username and password. "Doorbell pressed" fires on button
 press and "Open door" (relay 1/2) switches the relay. With a PIR input fitted,
 the presence state follows the sensor.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
