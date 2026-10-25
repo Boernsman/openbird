@@ -78,6 +78,13 @@ OpenBird announces itself the way the nymea plugin expects:
 
 The DHCP host name is `openbird-<last 6 MAC digits>`.
 
+IPv6 is enabled (link-local address only), and the web server accepts both
+IPv4 and IPv6. Without an IPv6 address, the mDNS responder leaves AAAA queries
+unanswered, and browsers and curl wait for that answer before they use IPv4,
+so `http://bha-<mac>.local/` appears not to load. A side effect: mDNS also
+runs over IPv6, so nymea may see an additional IPv6 entry for the device.
+Check with `avahi-browse -rt _axis-video._tcp` on the nymea host.
+
 ## Implemented API
 
 All `/bha-api/*` endpoints require HTTP Basic auth. DoorBird-style

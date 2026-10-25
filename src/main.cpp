@@ -22,7 +22,7 @@
 #include "settings.h"
 #include "webpage.h"
 
-static WiFiServer server(80);
+static int listenFd = -1;
 static volatile bool ethConnected = false;
 static bool mdnsStarted = false;
 static bool otaStarted = false;
@@ -208,6 +208,64 @@ static void monitorLoop()
                 monitorSendAll(m, true);
         }
     }
+}
+
+// ---- HTTP server socket -----------------------------------------------------------
+// WiFiServer only listens on IPv4. With IPv6 enabled, mDNS also announces the
+// link-local IPv6 address and clients may connect over it, so listen dual-stack:
+// lwIP accepts IPv4 on an IPv6 socket bound to the "any" address.
+
+static bool httpListen(uint16_t port)
+{
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0)
+        return false;
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    struct sockaddr_in6 addr = {};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_port = htons(port); // sin6_addr all zero = any address, IPv4 and IPv6
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(fd, 4) < 0) {
+        close(fd);
+        return false;
+    }
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    listenFd = fd;
+    return true;
+}
+
+static WiFiClient httpAccept()
+{
+    if (listenFd < 0)
+        return WiFiClient();
+    int fd = accept(listenFd, nullptr, nullptr);
+    if (fd < 0)
+        return WiFiClient();
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+    return WiFiClient(fd);
+}
+
+// WiFiClient::remoteIP() only understands IPv4 socket addresses
+static String peerName(WiFiClient &client)
+{
+    struct sockaddr_storage addr = {};
+    socklen_t len = sizeof(addr);
+    if (getpeername(client.fd(), (struct sockaddr *)&addr, &len) < 0)
+        return "?";
+    char buf[INET6_ADDRSTRLEN] = "?";
+    if (addr.ss_family == AF_INET) {
+        inet_ntop(AF_INET, &((struct sockaddr_in *)&addr)->sin_addr, buf, sizeof(buf));
+    } else if (addr.ss_family == AF_INET6) {
+        struct in6_addr *a = &((struct sockaddr_in6 *)&addr)->sin6_addr;
+        // IPv4 clients on the dual-stack socket appear as ::ffff:a.b.c.d
+        static const uint8_t v4mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+        if (memcmp(a->s6_addr, v4mapped, sizeof(v4mapped)) == 0)
+            inet_ntop(AF_INET, &a->s6_addr[12], buf, sizeof(buf));
+        else
+            inet_ntop(AF_INET6, a, buf, sizeof(buf));
+    }
+    return buf;
 }
 
 // ---- HTTP helpers --------------------------------------------------------------
@@ -469,7 +527,7 @@ static bool handleMonitor(WiFiClient &client, const Request &req)
     monitors[slot].motion = wantMotion;
     monitors[slot].connectedAt = millis();
     monitorSendAll(monitors[slot]); // report the current state right away
-    Serial.printf("Monitor client %s connected (slot %d)\n", client.remoteIP().toString().c_str(), slot);
+    Serial.printf("Monitor client %s connected (slot %d)\n", peerName(client).c_str(), slot);
     return true;
 }
 
@@ -687,7 +745,7 @@ static bool handleRequest(WiFiClient &client, const Request &req)
 
 static void httpLoop()
 {
-    WiFiClient client = server.available();
+    WiFiClient client = httpAccept();
     if (!client)
         return;
     Request req;
@@ -695,7 +753,7 @@ static void httpLoop()
         client.stop();
         return;
     }
-    Serial.printf("%s %s %s\n", client.remoteIP().toString().c_str(), req.method.c_str(), req.path.c_str());
+    Serial.printf("%s %s %s\n", peerName(client).c_str(), req.method.c_str(), req.path.c_str());
     if (!handleRequest(client, req)) {
         client.flush();
         client.stop();
@@ -767,6 +825,12 @@ static void onNetworkEvent(WiFiEvent_t event)
     }
     case ARDUINO_EVENT_ETH_CONNECTED:
         Serial.println("ETH link up");
+        // Without an IPv6 address mDNS leaves AAAA queries unanswered, and clients
+        // that ask for both (browsers, curl) wait for the timeout before using IPv4
+        ETH.enableIpV6();
+        break;
+    case ARDUINO_EVENT_ETH_GOT_IP6:
+        Serial.printf("ETH IPv6 %s\n", ETH.localIPv6().toString().c_str());
         break;
     case ARDUINO_EVENT_ETH_GOT_IP:
         Serial.printf("ETH IP %s, %s, %dMbps\n", ETH.localIP().toString().c_str(),
@@ -853,7 +917,8 @@ void setup()
     if (!ETH.begin())
         Serial.println("ETH init failed");
 
-    server.begin();
+    if (!httpListen(80))
+        Serial.println("HTTP server start failed");
 }
 
 void loop()
