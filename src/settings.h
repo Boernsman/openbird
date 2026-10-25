@@ -7,6 +7,7 @@ struct Settings {
     String user;
     String password;
     uint32_t relayPulseMs;
+    uint8_t volume; // chime volume 0..100, 0 = off
 };
 
 extern Settings settings;

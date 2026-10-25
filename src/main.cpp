@@ -17,6 +17,7 @@
 #include <esp_task_wdt.h>
 #include <lwip/sockets.h>
 
+#include "chime.h"
 #include "config.h"
 #include "notify.h"
 #include "settings.h"
@@ -572,6 +573,8 @@ static void sendSettingsPage(WiFiClient &client, const String &message, bool err
     page.replace("%TOKEN%", formToken);
     page.replace("%USER%", htmlEscape(settings.user));
     page.replace("%PULSE%", String(settings.relayPulseMs));
+    page.replace("%VOLUME%", String(settings.volume));
+    page.replace("%CHIME_DISABLED%", chimeAvailable() ? "" : "disabled");
     sendResponse(client, 200, "OK", "text/html; charset=utf-8", page, "Cache-Control: no-store\r\n");
 }
 
@@ -584,6 +587,7 @@ static void handleSettingsPost(WiFiClient &client, const Request &req)
     String user = queryParam(req.body, "user");
     String password = queryParam(req.body, "password");
     long pulse = queryParam(req.body, "pulse").toInt();
+    long volume = queryParam(req.body, "volume").toInt();
     user.trim();
 
     // A colon would break HTTP Basic auth, which splits user and password at the first one
@@ -599,12 +603,17 @@ static void handleSettingsPost(WiFiClient &client, const Request &req)
         sendSettingsPage(client, "Relay pulse must be between 100 and 30000 ms.", true);
         return;
     }
+    if (volume < 0 || volume > 100) {
+        sendSettingsPage(client, "Chime volume must be between 0 and 100.", true);
+        return;
+    }
 
     bool credentialsChanged = user != settings.user || (!password.isEmpty() && password != settings.password);
     settings.user = user;
     if (!password.isEmpty())
         settings.password = password;
     settings.relayPulseMs = pulse;
+    settings.volume = volume;
     settingsSave();
     Serial.println("Settings saved");
 
@@ -682,9 +691,18 @@ static void handleSchedule(WiFiClient &client, const Request &req)
 // Returns true if the client connection was handed over and must not be closed.
 static bool handleRequest(WiFiClient &client, const Request &req)
 {
-    if (req.path == "/" || req.path == "/settings") {
+    if (req.path == "/" || req.path == "/settings" || req.path == "/chime") {
         if (req.authorization != expectedAuth) {
             sendUnauthorized(client);
+        } else if (req.path == "/chime") {
+            if (req.method != "POST") {
+                sendResponse(client, 405, "Method Not Allowed", "text/plain", "Use POST\n", "Allow: POST\r\n");
+            } else if (!chimeAvailable()) {
+                sendResponse(client, 503, "Service Unavailable", "text/plain", "No speaker configured\n");
+            } else {
+                chimePlay();
+                sendResponse(client, 200, "OK", "text/plain", "");
+            }
         } else if (req.path == "/settings" && req.method == "POST") {
             handleSettingsPost(client, req);
         } else {
@@ -896,6 +914,7 @@ void setup()
     settingsLoad();
     formToken = randomHex(16);
     notificationKey = randomHex(32);
+    chimeBegin();
     notifyBegin([](int relay) {
         if (relay >= 1 && relay <= 2 && relays[relay - 1].pin >= 0)
             outputPulse(relays[relay - 1], settings.relayPulseMs);
@@ -928,8 +947,10 @@ void loop()
     if (inputLoop(doorbell)) {
         Serial.printf("Doorbell %s\n", doorbell.state ? "pressed" : "released");
         monitorBroadcast(doorbell);
-        if (doorbell.state)
+        if (doorbell.state) {
+            chimePlay();
             notifyTrigger("doorbell");
+        }
     }
     if (inputLoop(motion)) {
         Serial.printf("Motion %s\n", motion.state ? "detected" : "cleared");

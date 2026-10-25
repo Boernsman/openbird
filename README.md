@@ -7,6 +7,7 @@ discovery and doorbell events.
 - Ethernet (LAN8720) with DHCP, powered via PoE
 - Doorbell button input → `doorbell:H` / `doorbell:L` events on `monitor.cgi`
 - Door opener relay output → `open-door.cgi?r=1`
+- Door chime on a speaker (I2S amplifier) when the button is pressed
 - Optional: second relay (`r=2`), PIR motion input (`motionsensor` events), light output (`light-on.cgi`)
 - Favorites and schedules (`favorites.cgi`, `schedule.cgi`): HTTP(S) notifications and relay actions on ring or motion, e.g. for Home Assistant's DoorBird integration
 - Settings page (username, password, relay pulse) stored in flash
@@ -21,9 +22,25 @@ discovery and doorbell events.
 | Relay 2         | –    | `RELAY2_PIN`                                             |
 | Motion (PIR)    | –    | `MOTION_PIN`                                             |
 | Light           | –    | `LIGHT_PIN`                                              |
+| Speaker BCLK    | 14   | MAX98357A `BCLK` (`SPEAKER_BCLK_PIN`)                    |
+| Speaker LRC     | 13   | MAX98357A `LRC` (`SPEAKER_LRC_PIN`)                      |
+| Speaker DIN     | 4    | MAX98357A `DIN` (`SPEAKER_DIN_PIN`)                      |
 
 For a bench test without wiring, set `DOORBELL_PIN 34` and `DOORBELL_PULLUP 0`
 to use the on-board BUT1 button.
+
+### Speaker
+
+Connect a MAX98357A I2S amplifier board: `VIN` to 5V, `GND` to GND, the three
+signal pins as in the table above, and a 4–8 Ω speaker to its outputs. Leave
+`SD` and `GAIN` unconnected (mono mix, 9 dB gain). A button press plays a
+synthesized "ding-dong" (about 3 s). The volume is set on the settings page
+(0 = off), which also has a "Play chime" button (`POST /chime`). The speaker
+pins are on the UEXT/EXT headers. Set them to `-1` to disable the speaker.
+
+The ESP32's internal DAC can't be used: GPIO25/26 are taken by Ethernet. I2S
+runs without the APLL, because on this board the APLL generates the Ethernet
+clock.
 
 Don't drive a relay coil from a GPIO directly. Use a relay module with a
 transistor driver or an opto-isolated input.
@@ -32,7 +49,7 @@ transistor driver or an opto-isolated input.
 
 Open `http://bha-<mac>.local/` in a browser and log in with the current
 credentials (default `openbird` / `changeme`). There you can change the
-username, password and relay pulse length. The settings are kept in flash.
+username, password, relay pulse length and chime volume. The settings are kept in flash.
 After changing the credentials, re-pair the device in nymea.
 
 **Factory reset:** hold the on-board BUT1 button for 10 seconds. This restores

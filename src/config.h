@@ -62,6 +62,21 @@
 #define LIGHT_ON_MS 180000 // DoorBird keeps the IR light on for 3 minutes
 #endif
 
+// ---- Speaker (I2S amplifier, e.g. MAX98357A), set a pin to -1 to disable --------
+// Default pins are on the UEXT/EXT headers. GPIO25/26 (internal DAC) are used by Ethernet.
+#ifndef SPEAKER_BCLK_PIN
+#define SPEAKER_BCLK_PIN 14
+#endif
+#ifndef SPEAKER_LRC_PIN
+#define SPEAKER_LRC_PIN 13
+#endif
+#ifndef SPEAKER_DIN_PIN
+#define SPEAKER_DIN_PIN 4
+#endif
+#ifndef CHIME_VOLUME
+#define CHIME_VOLUME 60 // default 0..100, adjustable on the settings page, 0 = off
+#endif
+
 // ---- Event monitor ----------------------------------------------------------
 #ifndef MAX_MONITOR_CLIENTS
 #define MAX_MONITOR_CLIENTS 4

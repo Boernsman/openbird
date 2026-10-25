@@ -16,6 +16,7 @@ void settingsLoad()
     settings.user = prefs.isKey("user") ? prefs.getString("user") : String(OPENBIRD_USER);
     settings.password = prefs.isKey("password") ? prefs.getString("password") : String(OPENBIRD_PASSWORD);
     settings.relayPulseMs = prefs.isKey("relayPulse") ? prefs.getUInt("relayPulse") : RELAY_PULSE_MS;
+    settings.volume = prefs.isKey("volume") ? prefs.getUChar("volume") : CHIME_VOLUME;
     prefs.end();
 }
 
@@ -26,6 +27,7 @@ void settingsSave()
     prefs.putString("user", settings.user);
     prefs.putString("password", settings.password);
     prefs.putUInt("relayPulse", settings.relayPulseMs);
+    prefs.putUChar("volume", settings.volume);
     prefs.end();
 }
 

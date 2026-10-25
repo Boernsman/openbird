@@ -27,8 +27,9 @@ button{margin-top:1rem;padding:.5rem 1rem;font-size:1rem}.msg{padding:.5rem;back
 <tr><td>Time</td><td>%TIME%</td></tr>
 </table>
 
-<h2>Relay test</h2>
+<h2>Test</h2>
 <button type="button" onclick="fetch('/bha-api/open-door.cgi?r=1')">Pulse relay 1</button>
+<button type="button" onclick="fetch('/chime',{method:'POST'})" %CHIME_DISABLED%>Play chime</button>
 
 <h2>Settings</h2>
 <form method="post" action="/settings">
@@ -36,6 +37,7 @@ button{margin-top:1rem;padding:.5rem 1rem;font-size:1rem}.msg{padding:.5rem;back
 <label>Username<input name="user" value="%USER%" maxlength="32" required></label>
 <label>New password <small>(leave empty to keep)</small><input name="password" type="password" maxlength="64" autocomplete="new-password"></label>
 <label>Relay pulse (ms)<input name="pulse" type="number" min="100" max="30000" value="%PULSE%" required></label>
+<label>Chime volume <small>(0 = off)</small><input name="volume" type="number" min="0" max="100" value="%VOLUME%" required></label>
 <button type="submit">Save</button>
 <p><small>Changing the username or password disconnects all clients. Re-pair the device in nymea with the new credentials.</small></p>
 </form>
