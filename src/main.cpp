@@ -4,23 +4,32 @@
 //   mDNS:  _axis-video._tcp, host "bha-<mac>", TXT "macaddress=<MAC>"
 //   HTTP:  /bha-api/getsession.cgi, info.cgi, open-door.cgi, light-on.cgi,
 //          monitor.cgi (multipart event stream), favorites.cgi, schedule.cgi, restart.cgi
+// Plus a settings page on "/", ArduinoOTA updates and factory reset via BUT1.
 
 #include <Arduino.h>
+#include <ArduinoOTA.h>
 #include <ETH.h>
 #include <ESPmDNS.h>
 #include <WiFi.h>
 #include <base64.h>
 #include <esp_mac.h>
+#include <esp_task_wdt.h>
+#include <lwip/sockets.h>
 
 #include "config.h"
+#include "settings.h"
+#include "webpage.h"
 
 static WiFiServer server(80);
-static bool ethConnected = false;
+static volatile bool ethConnected = false;
 static bool mdnsStarted = false;
+static bool otaStarted = false;
 
 static String macAddress;    // "1CCAE3AABBCC" style, upper case, no colons
+static String mdnsHost;      // "bha-1ccae3aabbcc"
 static String sessionId;
 static String expectedAuth;  // "Basic <base64(user:pass)>"
+static String formToken;     // guards the settings form against cross-site posts
 
 // ---- Outputs ----------------------------------------------------------------
 
@@ -111,6 +120,7 @@ struct MonitorClient {
     WiFiClient client;
     bool doorbell;
     bool motion;
+    uint32_t connectedAt;
 };
 
 static MonitorClient monitors[MAX_MONITOR_CLIENTS];
@@ -148,6 +158,36 @@ static void monitorSendAll(MonitorClient &m, bool heartbeat = false)
         monitorSend(m, motion);
 }
 
+static int monitorCount()
+{
+    int count = 0;
+    for (MonitorClient &m : monitors) {
+        if (m.client && m.client.connected())
+            count++;
+    }
+    return count;
+}
+
+static void monitorDisconnectAll()
+{
+    for (MonitorClient &m : monitors)
+        m.client.stop();
+}
+
+// TCP keepalive drops clients that vanished without closing the connection,
+// so their slot frees up and writes never pile up in the send buffer.
+static void enableKeepalive(WiFiClient &client)
+{
+    int fd = client.fd();
+    if (fd < 0)
+        return;
+    int on = 1, idle = 30, interval = 5, count = 3;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+}
+
 static void monitorLoop()
 {
     for (MonitorClient &m : monitors) {
@@ -173,6 +213,7 @@ struct Request {
     String path;
     String query;
     String authorization;
+    String body; // only read for small bodies (form posts)
 };
 
 static String urlDecode(const String &s)
@@ -236,6 +277,7 @@ static bool readRequest(WiFiClient &client, Request &req)
     req.query = q < 0 ? String() : target.substring(q + 1);
 
     // Headers
+    long contentLength = 0;
     while (client.connected()) {
         String h = client.readStringUntil('\n');
         h.trim();
@@ -244,9 +286,35 @@ static bool readRequest(WiFiClient &client, Request &req)
         if (h.length() > 14 && h.substring(0, 14).equalsIgnoreCase("Authorization:")) {
             req.authorization = h.substring(14);
             req.authorization.trim();
+        } else if (h.length() > 15 && h.substring(0, 15).equalsIgnoreCase("Content-Length:")) {
+            contentLength = h.substring(15).toInt();
         }
     }
+
+    if (contentLength > 0 && contentLength <= 2048) {
+        char buf[2049];
+        size_t n = client.readBytes(buf, contentLength);
+        buf[n] = 0;
+        req.body = buf;
+    }
     return true;
+}
+
+static String htmlEscape(const String &s)
+{
+    String out;
+    out.reserve(s.length());
+    for (char c : s) {
+        switch (c) {
+        case '&': out += "&amp;"; break;
+        case '<': out += "&lt;"; break;
+        case '>': out += "&gt;"; break;
+        case '"': out += "&quot;"; break;
+        case '\'': out += "&#39;"; break;
+        default: out += c;
+        }
+    }
+    return out;
 }
 
 static void sendResponse(WiFiClient &client, int code, const char *status,
@@ -276,12 +344,45 @@ static bool isAuthorized(const Request &req)
     if (req.authorization == expectedAuth)
         return true;
     // DoorBird also accepts credentials or a session id as query parameters
-    if (queryParam(req.query, "http-user") == OPENBIRD_USER &&
-        queryParam(req.query, "http-password") == OPENBIRD_PASSWORD)
+    bool hasUser = false;
+    String user = queryParam(req.query, "http-user", &hasUser);
+    if (hasUser && user == settings.user && queryParam(req.query, "http-password") == settings.password)
         return true;
     bool hasSession = false;
     String sid = queryParam(req.query, "sessionid", &hasSession);
     return hasSession && sid == sessionId;
+}
+
+static void sendUnauthorized(WiFiClient &client)
+{
+    // Keep the realm constant: Qt caches the credentials from getsession.cgi per
+    // host + realm and resends them when later requests get a 401.
+    sendResponse(client, 401, "Unauthorized", "text/plain", "Unauthorized\n",
+                 "WWW-Authenticate: Basic realm=\"DoorBird\"\r\n");
+}
+
+static String randomHex(size_t bytes)
+{
+    String s;
+    for (size_t i = 0; i < bytes; i++) {
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02x", (unsigned)(esp_random() & 0xff));
+        s += buf;
+    }
+    return s;
+}
+
+// Called at boot and whenever the credentials change
+static void applyCredentials()
+{
+    expectedAuth = "Basic " + base64::encode(settings.user + ":" + settings.password);
+    sessionId = randomHex(32);
+    monitorDisconnectAll();
+    if (otaStarted) {
+        ArduinoOTA.end();
+        ArduinoOTA.setPassword(settings.password.c_str());
+        ArduinoOTA.begin();
+    }
 }
 
 // ---- API handlers ---------------------------------------------------------------
@@ -311,7 +412,7 @@ static void handleOpenDoor(WiFiClient &client, const Request &req)
         return;
     }
     Serial.printf("Opening door, relay %d\n", index);
-    outputPulse(relays[index - 1], RELAY_PULSE_MS);
+    outputPulse(relays[index - 1], settings.relayPulseMs);
     sendOk(client);
 }
 
@@ -328,47 +429,128 @@ static bool handleMonitor(WiFiClient &client, const Request &req)
     bool wantDoorbell = ring.isEmpty() || ring.indexOf("doorbell") >= 0;
     bool wantMotion = ring.isEmpty() || ring.indexOf("motionsensor") >= 0;
 
-    int slot = -1;
+    // Take a free slot, or replace the oldest connection: a client that reconnects
+    // must not be locked out by its own stale connection.
+    int slot = 0;
     for (int i = 0; i < MAX_MONITOR_CLIENTS; i++) {
         if (!monitors[i].client || !monitors[i].client.connected()) {
             slot = i;
             break;
         }
+        if ((int32_t)(monitors[i].connectedAt - monitors[slot].connectedAt) < 0)
+            slot = i;
     }
-    if (slot < 0) {
-        // DoorBird answers with 509 when too many monitor connections are open
-        sendResponse(client, 509, "Bandwidth Limit Exceeded", "text/plain", "Too many monitor clients\n");
-        return false;
-    }
+    monitors[slot].client.stop();
 
     client.print("HTTP/1.1 200 OK\r\n"
                  "Content-Type: multipart/x-mixed-replace; boundary=--ioboundary\r\n"
                  "Cache-Control: no-cache\r\n"
                  "Connection: close\r\n\r\n");
+    enableKeepalive(client);
     monitors[slot].client = client;
     monitors[slot].doorbell = wantDoorbell;
     monitors[slot].motion = wantMotion;
+    monitors[slot].connectedAt = millis();
     monitorSendAll(monitors[slot]); // report the current state right away
     Serial.printf("Monitor client %s connected (slot %d)\n", client.remoteIP().toString().c_str(), slot);
     return true;
 }
 
+// ---- Settings page ----------------------------------------------------------------
+
+static String formatUptime()
+{
+    uint32_t s = millis() / 1000;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%ud %02u:%02u:%02u", s / 86400, (s / 3600) % 24, (s / 60) % 60, s % 60);
+    return buf;
+}
+
+static void sendSettingsPage(WiFiClient &client, const String &message, bool error)
+{
+    String page = SETTINGS_PAGE;
+    page.replace("%MESSAGE%", message.isEmpty() ? String()
+                                                : String("<p class=\"msg") + (error ? " err" : "") + "\">" +
+                                                      htmlEscape(message) + "</p>");
+    page.replace("%DEVICE%", DEVICE_TYPE);
+    page.replace("%FIRMWARE%", FIRMWARE_VERSION " (" __DATE__ ")");
+    page.replace("%MAC%", macAddress);
+    page.replace("%IP%", ETH.localIP().toString());
+    page.replace("%HOST%", mdnsHost);
+    page.replace("%UPTIME%", formatUptime());
+    page.replace("%DOORBELL%", doorbell.pin < 0 ? "not fitted" : doorbell.state ? "pressed" : "idle");
+    page.replace("%MONITORS%", String(monitorCount()) + " / " + String(MAX_MONITOR_CLIENTS));
+    page.replace("%TOKEN%", formToken);
+    page.replace("%USER%", htmlEscape(settings.user));
+    page.replace("%PULSE%", String(settings.relayPulseMs));
+    sendResponse(client, 200, "OK", "text/html; charset=utf-8", page, "Cache-Control: no-store\r\n");
+}
+
+static void handleSettingsPost(WiFiClient &client, const Request &req)
+{
+    if (queryParam(req.body, "token") != formToken) {
+        sendSettingsPage(client, "Form expired, please try again.", true);
+        return;
+    }
+    String user = queryParam(req.body, "user");
+    String password = queryParam(req.body, "password");
+    long pulse = queryParam(req.body, "pulse").toInt();
+    user.trim();
+
+    // A colon would break HTTP Basic auth, which splits user and password at the first one
+    if (user.isEmpty() || user.length() > 32 || user.indexOf(':') >= 0) {
+        sendSettingsPage(client, "Username must be 1-32 characters and must not contain ':'.", true);
+        return;
+    }
+    if (password.length() > 64) {
+        sendSettingsPage(client, "Password must be at most 64 characters.", true);
+        return;
+    }
+    if (pulse < 100 || pulse > 30000) {
+        sendSettingsPage(client, "Relay pulse must be between 100 and 30000 ms.", true);
+        return;
+    }
+
+    bool credentialsChanged = user != settings.user || (!password.isEmpty() && password != settings.password);
+    settings.user = user;
+    if (!password.isEmpty())
+        settings.password = password;
+    settings.relayPulseMs = pulse;
+    settingsSave();
+    Serial.println("Settings saved");
+
+    if (credentialsChanged) {
+        // The browser still holds the old credentials and will ask for the new ones
+        sendResponse(client, 303, "See Other", "text/plain", "Saved\n", "Location: /\r\n");
+        client.flush();
+        client.stop();
+        applyCredentials();
+        return;
+    }
+    sendSettingsPage(client, "Settings saved.", false);
+}
+
 // Returns true if the client connection was handed over and must not be closed.
 static bool handleRequest(WiFiClient &client, const Request &req)
 {
-    if (!req.path.startsWith("/bha-api/")) {
-        if (req.path == "/") {
-            sendResponse(client, 200, "OK", "text/plain",
-                         "OpenBird " DEVICE_TYPE "\nMAC " + macAddress + "\nIP " + ETH.localIP().toString() + "\n");
+    if (req.path == "/" || req.path == "/settings") {
+        if (req.authorization != expectedAuth) {
+            sendUnauthorized(client);
+        } else if (req.path == "/settings" && req.method == "POST") {
+            handleSettingsPost(client, req);
         } else {
-            sendResponse(client, 404, "Not Found", "text/plain", "Not found\n");
+            sendSettingsPage(client, String(), false);
         }
         return false;
     }
 
+    if (!req.path.startsWith("/bha-api/")) {
+        sendResponse(client, 404, "Not Found", "text/plain", "Not found\n");
+        return false;
+    }
+
     if (!isAuthorized(req)) {
-        sendResponse(client, 401, "Unauthorized", "text/plain", "Unauthorized\n",
-                     "WWW-Authenticate: Basic realm=\"DoorBird\"\r\n");
+        sendUnauthorized(client);
         return false;
     }
 
@@ -434,9 +616,7 @@ static void startMdns()
 {
     if (mdnsStarted)
         return;
-    String host = "bha-" + macAddress;
-    host.toLowerCase();
-    if (!MDNS.begin(host.c_str())) {
+    if (!MDNS.begin(mdnsHost.c_str())) {
         Serial.println("mDNS start failed");
         return;
     }
@@ -447,7 +627,31 @@ static void startMdns()
     MDNS.addService("axis-video", "tcp", 80);
     MDNS.addServiceTxt("axis-video", "tcp", "macaddress", macAddress);
     mdnsStarted = true;
-    Serial.printf("mDNS: %s.local\n", host.c_str());
+    Serial.printf("mDNS: %s.local\n", mdnsHost.c_str());
+}
+
+static void startOta()
+{
+    if (otaStarted)
+        return;
+    ArduinoOTA.setHostname(mdnsHost.c_str());
+    ArduinoOTA.setPassword(settings.password.c_str());
+    ArduinoOTA.setMdnsEnabled(false); // mDNS is managed in startMdns()
+    ArduinoOTA.onStart([]() {
+        Serial.println("OTA update started");
+        // Flashing blocks loop() for longer than the watchdog timeout
+        esp_task_wdt_delete(NULL);
+        monitorDisconnectAll();
+        outputWrite(relays[0], false);
+        outputWrite(relays[1], false);
+    });
+    ArduinoOTA.onEnd([]() { Serial.println("OTA update done, restarting"); });
+    ArduinoOTA.onError([](ota_error_t error) {
+        Serial.printf("OTA update failed: %u\n", error);
+        esp_task_wdt_add(NULL);
+    });
+    ArduinoOTA.begin();
+    otaStarted = true;
 }
 
 static void onNetworkEvent(WiFiEvent_t event)
@@ -480,16 +684,28 @@ static void onNetworkEvent(WiFiEvent_t event)
     }
 }
 
-static String randomHex(size_t bytes)
+// ---- Factory reset ------------------------------------------------------------------
+
+#if RESET_PIN >= 0 && RESET_PIN != DOORBELL_PIN
+static void resetButtonLoop()
 {
-    String s;
-    for (size_t i = 0; i < bytes; i++) {
-        char buf[3];
-        snprintf(buf, sizeof(buf), "%02x", (unsigned)(esp_random() & 0xff));
-        s += buf;
+    static uint32_t pressedSince = 0;
+    if (digitalRead(RESET_PIN) == LOW) {
+        if (!pressedSince) {
+            pressedSince = millis() | 1;
+        } else if (millis() - pressedSince >= RESET_HOLD_MS) {
+            Serial.println("Factory reset");
+            settingsReset();
+            delay(100);
+            ESP.restart();
+        }
+    } else {
+        pressedSince = 0;
     }
-    return s;
 }
+#else
+static void resetButtonLoop() {}
+#endif
 
 // ---- Main ---------------------------------------------------------------------------
 
@@ -498,14 +714,20 @@ void setup()
     Serial.begin(115200);
     Serial.println("\nOpenBird starting");
 
+    esp_task_wdt_init(WATCHDOG_TIMEOUT_S, true);
+    esp_task_wdt_add(NULL);
+
     outputInit(relays[0]);
     outputInit(relays[1]);
     outputInit(light);
     inputInit(doorbell, DOORBELL_PULLUP);
     inputInit(motion, false);
+#if RESET_PIN >= 0 && RESET_PIN != DOORBELL_PIN
+    pinMode(RESET_PIN, INPUT); // BUT1 has an external pull-up
+#endif
 
-    expectedAuth = "Basic " + base64::encode(String(OPENBIRD_USER ":" OPENBIRD_PASSWORD));
-    sessionId = randomHex(32);
+    settingsLoad();
+    formToken = randomHex(16);
 
     // Read the MAC before ETH.begin(), the ETH_START event already needs it
     uint8_t mac[6];
@@ -513,6 +735,10 @@ void setup()
     char macStr[13];
     snprintf(macStr, sizeof(macStr), "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     macAddress = macStr;
+    mdnsHost = "bha-" + macAddress;
+    mdnsHost.toLowerCase();
+
+    applyCredentials();
 
     WiFi.onEvent(onNetworkEvent);
     ETH.begin(); // LAN8720 pin mapping comes from the esp32-poe-iso board variant
@@ -522,6 +748,8 @@ void setup()
 
 void loop()
 {
+    esp_task_wdt_reset();
+
     if (inputLoop(doorbell)) {
         Serial.printf("Doorbell %s\n", doorbell.state ? "pressed" : "released");
         monitorBroadcast(doorbell);
@@ -530,13 +758,17 @@ void loop()
         Serial.printf("Motion %s\n", motion.state ? "detected" : "cleared");
         monitorBroadcast(motion);
     }
+    resetButtonLoop();
 
     outputLoop(relays[0]);
     outputLoop(relays[1]);
     outputLoop(light);
 
-    if (ethConnected)
+    if (ethConnected) {
+        startOta();
+        ArduinoOTA.handle();
         httpLoop();
+    }
     monitorLoop();
 
     delay(1);

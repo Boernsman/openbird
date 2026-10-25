@@ -6,7 +6,8 @@
 #include "config_local.h"
 #endif
 
-// ---- Credentials (HTTP Basic auth, same as a DoorBird user) ----------------
+// ---- Default credentials (HTTP Basic auth, same as a DoorBird user) ---------
+// Used until changed on the settings page; also the ArduinoOTA password.
 #ifndef OPENBIRD_USER
 #define OPENBIRD_USER "openbird"
 #endif
@@ -50,7 +51,7 @@
 #define RELAY_ACTIVE_HIGH 1 // many cheap relay modules are active low -> 0
 #endif
 #ifndef RELAY_PULSE_MS
-#define RELAY_PULSE_MS 3000
+#define RELAY_PULSE_MS 3000 // default, adjustable on the settings page
 #endif
 
 // ---- Optional light output for "light-on.cgi", -1 = not fitted --------------
@@ -67,6 +68,21 @@
 #endif
 #ifndef MONITOR_HEARTBEAT_MS
 #define MONITOR_HEARTBEAT_MS 30000
+#endif
+
+// ---- Factory reset ---------------------------------------------------------------
+// Hold the on-board BUT1 (GPIO34) for RESET_HOLD_MS to restore the defaults.
+// Disabled automatically when BUT1 is used as the doorbell.
+#ifndef RESET_PIN
+#define RESET_PIN 34
+#endif
+#ifndef RESET_HOLD_MS
+#define RESET_HOLD_MS 10000
+#endif
+
+// ---- Watchdog ------------------------------------------------------------------------
+#ifndef WATCHDOG_TIMEOUT_S
+#define WATCHDOG_TIMEOUT_S 30
 #endif
 
 // ---- Reported device info ----------------------------------------------------

@@ -8,6 +8,8 @@ discovery and doorbell events.
 - Doorbell button input → `doorbell:H` / `doorbell:L` events on `monitor.cgi`
 - Door opener relay output → `open-door.cgi?r=1`
 - Optional: second relay (`r=2`), PIR motion input (`motionsensor` events), light output (`light-on.cgi`)
+- Settings page (username, password, relay pulse) stored in flash
+- Network firmware updates (ArduinoOTA), watchdog, factory reset button
 
 ## Wiring (defaults, change in `src/config.h`)
 
@@ -27,7 +29,17 @@ transistor driver or an opto-isolated input.
 
 ## Configuration
 
-Create `src/config_local.h` (git-ignored) to override the defaults:
+Open `http://bha-<mac>.local/` in a browser and log in with the current
+credentials (default `openbird` / `changeme`). There you can change the
+username, password and relay pulse length. The settings are kept in flash.
+After changing the credentials, re-pair the device in nymea.
+
+**Factory reset:** hold the on-board BUT1 button for 10 seconds. This restores
+the compiled-in defaults. The reset is disabled if BUT1 is configured as the
+doorbell.
+
+Compile-time defaults and pins can be overridden in `src/config_local.h`
+(git-ignored):
 
 ```c
 #define OPENBIRD_USER     "doorbird"
@@ -39,8 +51,15 @@ Create `src/config_local.h` (git-ignored) to override the defaults:
 ## Build & flash
 
 ```sh
-pio run -t upload
+pio run -t upload        # first flash over USB
 pio device monitor
+```
+
+Later updates can go over the network. The OTA password is the device
+password:
+
+```sh
+OPENBIRD_HOST=bha-<mac>.local OPENBIRD_PASSWORD=<password> pio run -e ota -t upload
 ```
 
 ## Discovery
@@ -57,7 +76,10 @@ The DHCP host name is `openbird-<last 6 MAC digits>`.
 
 All `/bha-api/*` endpoints require HTTP Basic auth. DoorBird-style
 `?http-user=…&http-password=…` or `?sessionid=…` also work. Unauthenticated
-requests get a `401` with `WWW-Authenticate: Basic realm="DoorBird"`.
+requests get a `401` with `WWW-Authenticate: Basic realm="DoorBird"`. The
+nymea plugin only sends credentials with `getsession.cgi`. Qt caches them per
+host and realm and resends them on later 401s, so the realm must stay
+constant.
 
 | Endpoint                       | Behaviour                                                          |
 |--------------------------------|--------------------------------------------------------------------|
@@ -65,7 +87,7 @@ requests get a `401` with `WWW-Authenticate: Basic realm="DoorBird"`.
 | `info.cgi`                     | Firmware, MAC, relays, device type                                 |
 | `open-door.cgi?r=1\|2`         | Pulses the relay for `RELAY_PULSE_MS`                              |
 | `light-on.cgi`                 | Switches the light output on for `LIGHT_ON_MS` (no-op if not fitted)|
-| `monitor.cgi?ring=doorbell,motionsensor` | `multipart/x-mixed-replace` stream (boundary `--ioboundary`), current state on connect, heartbeat every 30 s, max 4 clients |
+| `monitor.cgi?ring=doorbell,motionsensor` | `multipart/x-mixed-replace` stream (boundary `--ioboundary`), current state on connect, heartbeat every 30 s. Max 4 clients; a new one replaces the oldest. TCP keepalive drops dead clients |
 | `favorites.cgi`, `schedule.cgi`| Return empty lists; saves are accepted but not stored              |
 | `restart.cgi`                  | Reboots                                                            |
 | `image.cgi`, `video.cgi`, `history.cgi`, audio | `503`, there is no camera or audio                 |
